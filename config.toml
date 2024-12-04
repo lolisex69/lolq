@@ -1,0 +1,23 @@
+# List of champions to pick from in order of preference
+picks = [
+    "Teemo",
+    "Annie",
+    "Ashe",
+    "Master Yi",
+    "Garen"
+]
+
+# List of champions to ban in order of preference 
+bans = [
+    "Yasuo", 
+    "Zed",
+    "Katarina",
+    "Lee Sin",
+    "Yone"
+]
+
+# LCU client port (typically 12345)
+lcu_port = 12345
+
+# LCU client password (from lockfile)
+lcu_password = "your-password-here"
