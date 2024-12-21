@@ -1,416 +1,384 @@
-use std::fs;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio;
-use serde::{Deserialize, Serialize};
-use reqwest;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
-use futures_util::{SinkExt, StreamExt};
-use toml;
-use std::process::Command;
 use std::collections::HashMap;
-use regex::Regex;
+use std::process::exit;
+use std::time::Duration;
+use tokio::time::sleep;
+use serde_json::{Value, json};
+use reqwest::{Client, ClientBuilder};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use futures_util::{StreamExt, SinkExt};
+use sysinfo::{System, SystemExt, Process, ProcessExt};
+use toml;
+use anyhow::{Result, anyhow};
+use url::Url;
+use std::sync::{Arc, Mutex};
 
-
-#[derive(Debug, Deserialize)]
-struct Config {
-    picks: Vec<String>,
-    bans: Vec<String>,
+#[derive(Debug)]
+struct GameState {
+    am_i_assigned: bool,
+    am_i_picking: bool,
+    am_i_banning: bool,
+    pick_number: usize,
+    ban_number: usize,
+    phase: String,
+    in_game: bool,
+    have_i_prepicked: bool,
+    action_id: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct ChampionData {
-    name: String,
-    id: i32,
+impl Default for GameState {
+    fn default() -> Self {
+        Self {
+            am_i_assigned: false,
+            am_i_picking: false,
+            am_i_banning: false,
+            pick_number: 0,
+            ban_number: 0,
+            phase: String::new(),
+            in_game: false,
+            have_i_prepicked: false,
+            action_id: None,
+        }
+    }
 }
 
-#[derive(Debug, Deserialize)]
-struct SummonerData {
-    #[serde(rename = "summonerId")]
-    summoner_id: i64,
+#[derive(Debug)]
+struct LcuConnection {
+    port: u16,
+    auth_token: String,
+    pid: u32,
 }
 
-struct LcuClient {
-    client: reqwest::Client,
-    base_url: String,
-    auth: String,
-}
-
-impl LcuClient {
-    async fn new() -> Option<Self> {
-        println!("Attempting to find League Client process...");
-        
-        // Find League process and extract port/password
-        let output = match Command::new("powershell")
-            .args(&[
-                "Get-WmiObject",
-                "Win32_Process",
-                "-Filter",
-                "name='LeagueClientUx.exe'",
-                "|",
-                "Select-Object",
-                "CommandLine",
-            ])
-            .output() {
-                Ok(output) => output,
-                Err(e) => {
-                    println!("Failed to execute PowerShell command: {}", e);
-                    return None;
-                }
-            };
-
-        let output_str = String::from_utf8_lossy(&output.stdout);
-        println!("PowerShell output: {}", output_str);
-        
-        if output_str.trim().is_empty() {
-            println!("No League Client process found. Is the client running?");
+impl LcuConnection {
+    fn new(process: &Process) -> Option<Self> {
+        let cmdline = process.cmd();
+        if cmdline.is_empty() {
             return None;
         }
         
-        let port_re = Regex::new(r"--app-port=(\d+)").unwrap();
-        let auth_re = Regex::new(r"--remoting-auth-token=([a-zA-Z0-9_-]+)").unwrap();
+        let mut port = None;
+        let mut auth_token = None;
+        let mut pid = None;
 
-        let port = match port_re.captures(&output_str) {
-            Some(cap) => match cap.get(1) {
-                Some(p) => p.as_str(),
-                None => {
-                    println!("Failed to extract port from client arguments");
-                    return None;
-                }
-            },
-            None => {
-                println!("Could not find app-port in client arguments");
-                return None;
+        for arg in cmdline {
+            if arg.starts_with("--app-port=") {
+                port = arg.strip_prefix("--app-port=").and_then(|p| p.parse().ok());
+            } else if arg.starts_with("--remoting-auth-token=") {
+                auth_token = arg.strip_prefix("--remoting-auth-token=").map(String::from);
+            } else if arg.starts_with("--app-pid=") {
+                pid = arg.strip_prefix("--app-pid=").and_then(|p| p.parse().ok());
             }
-        };
-
-        let auth = match auth_re.captures(&output_str) {
-            Some(cap) => match cap.get(1) {
-                Some(a) => a.as_str(),
-                None => {
-                    println!("Failed to extract auth token from client arguments");
-                    return None;
-                }
-            },
-            None => {
-                println!("Could not find auth token in client arguments");
-                return None;
-            }
-        };
-
-        println!("Found League Client - Port: {}, Auth token: {}", port, auth);
-
-        let client = reqwest::Client::builder()
-            .danger_accept_invalid_certs(true)
-            .build()
-            .unwrap();
-        
-        let base_url = format!("https://127.0.0.1:{}", port);
-
-        Some(Self {
-            client,
-            base_url,
-            auth: auth.to_string(),
-        })
-    }
-
-    async fn get<T: for<'de> Deserialize<'de>>(&self, path: &str) -> Result<T, reqwest::Error> {
-        println!("Making GET request to {}{}", self.base_url, path);
-        let response = self.client
-            .get(format!("{}{}", self.base_url, path))
-            .basic_auth("riot", Some(&self.auth))
-            .send()
-            .await?;
-            
-        println!("Response status: {}", response.status());
-        response.json().await
-    }
-
-    async fn post(&self, path: &str, json: Option<serde_json::Value>) -> Result<(), reqwest::Error> {
-        println!("Making POST request to {}{}", self.base_url, path);
-        if let Some(ref j) = json {
-            println!("Request body: {}", j);
-        }
-        
-        let mut req = self.client
-            .post(format!("{}{}", self.base_url, path))
-            .basic_auth("riot", Some(&self.auth));
-
-        if let Some(json) = json {
-            req = req.json(&json);
         }
 
-        let response = req.send().await?;
-        println!("Response status: {}", response.status());
-        Ok(())
+        match (port, auth_token, pid) {
+            (Some(p), Some(t), Some(pid)) => Some(Self {
+                port: p,
+                auth_token: t,
+                pid,
+            }),
+            _ => None
+        }
     }
 
-    async fn patch(&self, path: &str, json: serde_json::Value) -> Result<(), reqwest::Error> {
-        println!("Making PATCH request to {}{}", self.base_url, path);
-        println!("Request body: {}", json);
-        
-        let response = self.client
-            .patch(format!("{}{}", self.base_url, path))
-            .basic_auth("riot", Some(&self.auth))
-            .json(&json)
-            .send()
-            .await?;
-            
-        println!("Response status: {}", response.status());
-        Ok(())
+    fn find() -> Option<Self> {
+        let sys = System::new_all();
+        sys.processes().values()
+            .find(|process| process.name().contains("LeagueClientUx"))
+            .and_then(Self::new)
     }
 }
 
 #[tokio::main]
-async fn main() {
-    println!("Starting League Queue Assistant...");
-    
+async fn main() -> Result<()> {
     // Load config
-    println!("Loading config from config.toml...");
-    let config: Config = match fs::read_to_string("config.toml") {
-        Ok(contents) => match toml::from_str(&contents) {
-            Ok(config) => {
-                println!("Loaded config successfully:");
-                println!("Picks: {:?}", config.picks);
-                println!("Bans: {:?}", config.bans);
-                config
-            },
-            Err(e) => {
-                println!("Failed to parse config.toml: {}", e);
-                return;
-            }
-        },
-        Err(e) => {
-            println!("Failed to read config.toml: {}", e);
-            return;
-        }
-    };
+    let config = std::fs::read_to_string("config.toml")?;
+    let config: Value = toml::from_str(&config)?;
+    
+    let picks = config.get("picks")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("Missing or invalid picks in config"))?;
+    
+    let bans = config.get("bans")
+        .and_then(|v| v.as_array()) 
+        .ok_or_else(|| anyhow!("Missing or invalid bans in config"))?;
 
-    println!("Connecting to League Client...");
-    let lcu = match LcuClient::new().await {
-        Some(client) => client,
-        None => {
-            println!("Failed to connect to League Client. Make sure the client is running and try again.");
-            return;
-        }
-    };
+    if picks.is_empty() || bans.is_empty() {
+        eprintln!("Picks or bans list is empty in config.toml");
+        exit(1);
+    }
 
-    // Get summoner data
-    println!("Fetching summoner data...");
-    let summoner: SummonerData = match lcu.get("/lol-summoner/v1/current-summoner").await {
-        Ok(data) => {
-            println!("Got summoner data - ID: {}", data.summoner_id);
-            data
-        },
-        Err(e) => {
-            println!("Failed to get summoner data: {}", e);
-            return;
-        }
-    };
+    // Find League client
+    let connection = LcuConnection::find()
+        .ok_or_else(|| anyhow!("League client not found"))?;
+
+    // Setup HTTP client
+    let auth = format!("riot:{}", connection.auth_token);
+    let auth = format!("Basic {}", BASE64.encode(auth));
+
+    let client = ClientBuilder::new()
+        .danger_accept_invalid_certs(true)
+        .default_headers({
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("Authorization", auth.parse()?);
+            headers.insert("Content-Type", "application/json".parse()?);
+            headers
+        })
+        .build()?;
 
     // Get champion data
-    println!("Fetching champion data...");
-    let champions: Vec<ChampionData> = match lcu.get(&format!(
-        "/lol-champions/v1/inventories/{}/champions-minimal",
-        summoner.summoner_id
-    )).await {
-        Ok(data) => {
-            println!("Successfully retrieved data for {} champions", data.len());
-            data
-        },
-        Err(e) => {
-            println!("Failed to get champion data: {}", e);
-            return;
-        }
-    };
-
-    let champions_map: HashMap<String, i32> = champions
-        .into_iter()
-        .map(|c| (c.name, c.id))
-        .collect();
-
-    println!("Loaded {} champions into lookup map", champions_map.len());
-
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-
-    let ws_url = format!("wss://127.0.0.1:{}", lcu.base_url.split(":").nth(2).unwrap());
-    println!("Connecting to websocket at {}", ws_url);
+    let champions = get_champions(&client).await?;
     
-    let (mut ws_stream, _) = match connect_async(ws_url).await {
-        Ok(conn) => {
-            println!("Successfully connected to LCU websocket");
-            conn
-        },
-        Err(e) => {
-            println!("Failed to connect to LCU websocket: {}", e);
-            return;
+    // Connect websocket
+    let ws_url = format!("wss://127.0.0.1:{}", connection.port);
+    let (mut ws_stream, _) = connect_async(
+        Url::parse(&ws_url)?.to_string()
+    ).await?;
+
+    // Subscribe to events
+    ws_stream.send(Message::Text(json!([5, "OnJsonApiEvent"]).to_string())).await?;
+
+    let game_state = Arc::new(Mutex::new(GameState::default()));
+
+    // Main event loop
+    while let Some(msg) = ws_stream.next().await {
+        let msg = msg?;
+        if let Message::Text(text) = msg {
+            handle_message(&client, &text, &champions, picks, bans, Arc::clone(&game_state), connection.port).await?;
         }
-    };
+    }
 
-    let mut pick_number = 0;
-    let mut ban_number = 0;
-    let mut am_i_assigned = false;
-    let mut am_i_picking = false;
-    let mut am_i_banning = false;
-    let mut have_i_prepicked = false;
-    let mut in_game = false;
-    let mut action_id = 0;
+    Ok(())
+}
 
-    println!("Entering main event loop...");
-    
-    while running.load(Ordering::SeqCst) {
-        if let Some(msg) = ws_stream.next().await {
-            let msg = match msg {
-                Ok(m) => m,
-                Err(e) => {
-                    println!("Error receiving websocket message: {}", e);
-                    continue;
+async fn get_champions(client: &Client) -> Result<HashMap<String, u32>> {
+    let version = client.get("https://ddragon.leagueoflegends.com/api/versions.json")
+        .send()
+        .await?
+        .json::<Vec<String>>()
+        .await?;
+        
+    let version = &version[0];
+
+    let champions = client.get(&format!(
+        "https://ddragon.leagueoflegends.com/cdn/{}/data/en_US/champion.json",
+        version
+    ))
+    .send()
+    .await?
+    .json::<Value>()
+    .await?;
+
+    let mut map = HashMap::new();
+    if let Some(data) = champions["data"].as_object() {
+        for (name, champion) in data {
+            if let Some(key) = champion["key"].as_str() {
+                if let Ok(key) = key.parse() {
+                    map.insert(name.clone(), key);
                 }
-            };
-            
-            let data: serde_json::Value = match serde_json::from_str(&msg.to_string()) {
-                Ok(d) => d,
-                Err(e) => {
-                    println!("Failed to parse websocket message: {}", e);
-                    continue;
-                }
-            };
-
-            match data["uri"].as_str() {
-                Some("/lol-matchmaking/v1/ready-check") => {
-                    println!("Received ready check event");
-                    if data["data"]["state"] == "InProgress" && data["data"]["playerResponse"] == "None" {
-                        println!("Accepting ready check...");
-                        if let Err(e) = lcu.post("/lol-matchmaking/v1/ready-check/accept", None).await {
-                            println!("Failed to accept ready check: {}", e);
-                        }
-                    }
-                }
-
-                Some("/lol-champ-select/v1/session") => {
-                    let session = &data["data"];
-                    let local_player_cell_id = session["localPlayerCellId"].as_i64().unwrap();
-                    let phase = session["timer"]["phase"].as_str().unwrap();
-                    println!("Champion select phase: {}", phase);
-                    have_i_prepicked = false;
-
-                    // Check if player is assigned a position
-                    for teammate in session["myTeam"].as_array().unwrap() {
-                        if teammate["cellId"] == local_player_cell_id {
-                            let assigned_position = teammate["assignedPosition"].as_str().unwrap();
-                            println!("Assigned position: {}", assigned_position);
-                            am_i_assigned = true;
-                        }
-                    }
-
-                    // Check current action
-                    for action_list in session["actions"].as_array().unwrap() {
-                        for action in action_list.as_array().unwrap() {
-                            if action["actorCellId"] == local_player_cell_id && action["isInProgress"].as_bool().unwrap() {
-                                let action_type = action["type"].as_str().unwrap();
-                                action_id = action["id"].as_i64().unwrap();
-                                println!("Current action: {} (ID: {})", action_type, action_id);
-
-                                if action_type == "ban" {
-                                    am_i_banning = action["isInProgress"].as_bool().unwrap();
-                                }
-                                if action_type == "pick" {
-                                    am_i_picking = action["isInProgress"].as_bool().unwrap();
-                                }
-
-                                // Handle banning phase
-                                if action_type == "ban" && phase == "BAN_PICK" && am_i_banning {
-                                    while am_i_banning {
-                                        println!("Attempting to ban {} (attempt {})", config.bans[ban_number], ban_number + 1);
-                                        if let Some(champion_id) = champions_map.get(&config.bans[ban_number]) {
-                                            if let Ok(_) = lcu.patch(
-                                                &format!("/lol-champ-select/v1/session/actions/{}", action_id),
-                                                serde_json::json!({
-                                                    "championId": champion_id,
-                                                    "completed": true
-                                                })
-                                            ).await {
-                                                println!("Successfully banned {}", config.bans[ban_number]);
-                                                ban_number += 1;
-                                                am_i_banning = false;
-                                            }
-                                        } else {
-                                            println!("Champion {} not available, trying next ban", config.bans[ban_number]);
-                                            ban_number = (ban_number + 1) % config.bans.len();
-                                        }
-                                    }
-                                }
-
-                                // Handle picking phase
-                                if action_type == "pick" && phase == "BAN_PICK" && am_i_picking {
-                                    while am_i_picking {
-                                        println!("Attempting to pick {} (attempt {})", config.picks[pick_number], pick_number + 1);
-                                        if let Some(champion_id) = champions_map.get(&config.picks[pick_number]) {
-                                            if let Ok(_) = lcu.patch(
-                                                &format!("/lol-champ-select/v1/session/actions/{}", action_id),
-                                                serde_json::json!({
-                                                    "championId": champion_id,
-                                                    "completed": true
-                                                })
-                                            ).await {
-                                                println!("Successfully picked {}", config.picks[pick_number]);
-                                                am_i_picking = false;
-                                            }
-                                        } else {
-                                            println!("Champion {} not available, trying next pick", config.picks[pick_number]);
-                                            pick_number = (pick_number + 1) % config.picks.len();
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Handle planning phase
-                    if phase == "PLANNING" && !have_i_prepicked {
-                        println!("Planning phase - attempting to pre-pick {}", config.picks[0]);
-                        if let Some(champion_id) = champions_map.get(&config.picks[0]) {
-                            if let Ok(_) = lcu.patch(
-                                &format!("/lol-champ-select/v1/session/actions/{}", action_id),
-                                serde_json::json!({
-                                    "championId": champion_id,
-                                    "completed": false
-                                })
-                            ).await {
-                                println!("Successfully pre-picked {}", config.picks[0]);
-                                have_i_prepicked = true;
-                            }
-                        }
-                    }
-
-                    // Handle game start
-                    if phase == "FINALIZATION" {
-                        println!("Finalization phase - checking if game has started...");
-                        if let Ok(game_data) = reqwest::Client::builder()
-                            .danger_accept_invalid_certs(true)
-                            .build()
-                            .unwrap()
-                            .get("https://127.0.0.1:2999/liveclientdata/allgamedata")
-                            .send()
-                            .await {
-                            if game_data.status().is_success() {
-                                let game_json: serde_json::Value = game_data.json().await.unwrap();
-                                if game_json["gameData"]["gameTime"].as_f64().unwrap() > 0.0 && !in_game {
-                                    println!("Game has started! Shutting down queue assistant.");
-                                    in_game = true;
-                                    running.store(false, Ordering::SeqCst);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                _ => {}
             }
         }
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    println!("len(champions_map)={}, champions_map={:?}", map.len(), map);
+
+    Ok(map)
+}
+
+async fn handle_message(
+    client: &Client,
+    msg: &str,
+    champions: &HashMap<String, u32>,
+    picks: &[Value],
+    bans: &[Value],
+    game_state: Arc<Mutex<GameState>>,
+    port: u16
+) -> Result<()> {
+    let data: Value = serde_json::from_str(msg)?;
+    
+    if let Some(data) = data.get(2) {
+        match data["uri"].as_str() {
+            Some("/lol-matchmaking/v1/ready-check") => {
+                if data["data"]["state"] == "InProgress" && data["data"]["playerResponse"] == "None" {
+                    client.post(format!("https://127.0.0.1:{}/lol-matchmaking/v1/ready-check/accept", port))
+                        .send()
+                        .await?;
+                }
+            }
+            Some("/lol-champ-select/v1/session") => {
+                let mut state = game_state.lock().unwrap();
+                state.have_i_prepicked = false;
+
+                let lobby_phase = data["data"]["timer"]["phase"].as_str().unwrap_or("");
+                let local_player_cell_id = data["data"]["localPlayerCellId"].as_i64().unwrap_or(-1);
+
+                // Track assigned position
+                if let Some(my_team) = data["data"]["myTeam"].as_array() {
+                    for teammate in my_team {
+                        if teammate["cellId"] == local_player_cell_id {
+                            let assigned_position = teammate["assignedPosition"].as_str().unwrap_or("");
+                            state.am_i_assigned = true;
+                            println!("Assigned position: {}", assigned_position);
+                        }
+                    }
+                }
+
+                // Track banned champions
+                let mut banned_champions = Vec::new();
+                if let Some(actions) = data["data"]["actions"].as_array() {
+                    for action_list in actions {
+                        if let Some(actions) = action_list.as_array() {
+                            for action in actions {
+                                if action["type"] == "ban" && action["completed"] == true {
+                                    if let Some(champion_id) = action["championId"].as_u64() {
+                                        banned_champions.push(champion_id as u32);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Find current action
+                if let Some(actions) = data["data"]["actions"].as_array() {
+                    for action_list in actions {
+                        if let Some(actions) = action_list.as_array() {
+                            for action in actions {
+                                if action["actorCellId"] == local_player_cell_id && action["isInProgress"] == true {
+                                    state.phase = action["type"].as_str().unwrap_or("").to_string();
+                                    state.action_id = action["id"].as_i64();
+                                    
+                                    if state.phase == "ban" {
+                                        state.am_i_banning = action["isInProgress"].as_bool().unwrap_or(false);
+                                    }
+                                    if state.phase == "pick" {
+                                        state.am_i_picking = action["isInProgress"].as_bool().unwrap_or(false);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Handle banning phase
+                if state.phase == "ban" && lobby_phase == "BAN_PICK" && state.am_i_banning {
+                    while state.am_i_banning && state.ban_number < bans.len() {
+                        if let Some(ban) = bans[state.ban_number].as_str() {
+                            if let Some(champion_id) = champions.get(ban) {
+                                let result = client.patch(format!("https://127.0.0.1:{}/lol-champ-select/v1/session/actions/{}", 
+                                    port, state.action_id.unwrap()))
+                                    .json(&json!({
+                                        "championId": champion_id,
+                                        "completed": true
+                                    }))
+                                    .send()
+                                    .await;
+
+                                match result {
+                                    Ok(_) => {
+                                        println!("Successfully banned {}", ban);
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        println!("Failed to ban {}: {}", ban, e);
+                                        state.ban_number += 1;
+                                        if state.ban_number >= bans.len() {
+                                            state.pick_number = 0;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    state.ban_number = 0;
+                    state.am_i_banning = false;
+                }
+
+                // Handle picking phase
+                if state.phase == "pick" && lobby_phase == "BAN_PICK" && state.am_i_picking {
+                    while state.am_i_picking && state.pick_number < picks.len() {
+                        if let Some(pick) = picks[state.pick_number].as_str() {
+                            if let Some(champion_id) = champions.get(pick) {
+                                // Check if champion is banned
+                                if banned_champions.contains(champion_id) {
+                                    println!("{} is banned, trying next pick", pick);
+                                    state.pick_number += 1;
+                                    continue;
+                                }
+
+                                let result = client.patch(format!("https://127.0.0.1:{}/lol-champ-select/v1/session/actions/{}", 
+                                    port, state.action_id.unwrap()))
+                                    .json(&json!({
+                                        "championId": champion_id,
+                                        "completed": true
+                                    }))
+                                    .send()
+                                    .await;
+
+                                match result {
+                                    Ok(_) => {
+                                        println!("Successfully picked {}", pick);
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        println!("Failed to pick {}: {}", pick, e);
+                                        state.pick_number += 1;
+                                        if state.pick_number >= picks.len() {
+                                            state.pick_number = 0;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    state.pick_number = 0;
+                    state.am_i_picking = false;
+                }
+
+                // Handle planning phase
+                if lobby_phase == "PLANNING" && !state.have_i_prepicked {
+                    if let Some(pick) = picks[0].as_str() {
+                        if let Some(champion_id) = champions.get(pick) {
+                            let result = client.patch(format!("https://127.0.0.1:{}/lol-champ-select/v1/session/actions/{}", 
+                                port, state.action_id.unwrap()))
+                                .json(&json!({
+                                    "championId": champion_id,
+                                    "completed": false
+                                }))
+                                .send()
+                                .await;
+
+                            match result {
+                                Ok(_) => {
+                                    println!("Pre-picked {}", pick);
+                                    state.have_i_prepicked = true;
+                                }
+                                Err(e) => {
+                                    println!("Failed to pre-pick {}: {}", pick, e);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Handle game start
+                if lobby_phase == "FINALIZATION" {
+                    let game_phase = client.get(format!("https://127.0.0.1:{}/lol-gameflow/v1/gameflow-phase", port))
+                        .send()
+                        .await?
+                        .text()
+                        .await?;
+
+                    if game_phase == "InGame" && !state.in_game {
+                        println!("Game started! Exiting champion select bot...");
+                        state.in_game = true;
+                        exit(69);
+                    }
+                    sleep(Duration::from_secs(2)).await;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
 }
